@@ -1,44 +1,61 @@
 import asyncio
+import html
 import logging
 import os
 import re
-import html
+from datetime import time
 from html.parser import HTMLParser
 from urllib.parse import urlparse
-from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
-import feedparser
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
-from openai import AsyncOpenAI
 
-from briefing import collect_articles, build_briefing
+from briefing import build_briefing, collect_articles
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("milintel")
-
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Prague"))
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-MODEL = os.getenv("OPENAI_MODEL", "gpt-6-mini")
+
+
+def _parse_ids(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    result = []
+    for item in re.split(r"[,;\s]+", raw.strip()):
+        item = item.strip()
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def recipient_chat_ids() -> list[int]:
+    # Prefer the plural variable; preserve compatibility with the old single-ID variable.
+    raw = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID", "")
+    ids = []
+    for item in _parse_ids(raw):
+        try:
+            ids.append(int(item))
+        except ValueError:
+            log.error("Ignoring invalid Telegram chat ID: %s", item)
+    return ids
 
 
 async def authorized(update: Update) -> bool:
-    allowed = os.getenv("TELEGRAM_ALLOWED_USER_ID")
+    allowed = _parse_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
+    if not allowed:
+        allowed = _parse_ids(os.getenv("TELEGRAM_ALLOWED_USER_ID"))
     if not allowed:
         return True
     user = update.effective_user
-    return bool(user and str(user.id) == allowed)
+    return bool(user and str(user.id) in allowed)
 
 
 class TelegramHTMLSanitizer(HTMLParser):
-    """Keep only Telegram-supported HTML and convert common block tags safely."""
     ALLOWED = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "blockquote"}
 
     def __init__(self):
@@ -67,8 +84,7 @@ class TelegramHTMLSanitizer(HTMLParser):
             href = html.unescape(attrs.get("href", "") or "")
             parsed = urlparse(href)
             if parsed.scheme in {"http", "https"} and parsed.netloc:
-                safe_href = html.escape(href, quote=True)
-                self.parts.append(f'<a href="{safe_href}">')
+                self.parts.append(f'<a href="{html.escape(href, quote=True)}">')
                 self.stack.append("a")
             return
         if tag in self.ALLOWED:
@@ -80,8 +96,7 @@ class TelegramHTMLSanitizer(HTMLParser):
         if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li"}:
             self._newline()
             return
-        if tag in {"a"} | self.ALLOWED and tag in self.stack:
-            # Close nested tags in reverse order until the matching tag.
+        if tag in ({"a"} | self.ALLOWED) and tag in self.stack:
             while self.stack:
                 open_tag = self.stack.pop()
                 self.parts.append(f"</{open_tag}>")
@@ -90,12 +105,6 @@ class TelegramHTMLSanitizer(HTMLParser):
 
     def handle_data(self, data):
         self.parts.append(html.escape(data))
-
-    def handle_entityref(self, name):
-        self.parts.append(f"&{name};")
-
-    def handle_charref(self, name):
-        self.parts.append(f"&#{name};")
 
     def result(self):
         while self.stack:
@@ -113,15 +122,16 @@ def sanitize_telegram_html(value: str) -> str:
     return parser.result()
 
 
-async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=False):
+async def generate_report(urgent: bool = False) -> str:
     articles = await asyncio.to_thread(collect_articles, urgent=urgent)
     if not articles:
-        await context.bot.send_message(chat_id=chat_id, text="Nenašel jsem dostatek nových zpráv z nastavených zdrojů.")
-        return
+        return "Nenašel jsem dostatek nových zpráv z nastavených zdrojů."
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     report = await build_briefing(client, articles, urgent=urgent)
-    report = sanitize_telegram_html(report)
-    # Telegram limit is 4096 chars; split at paragraph boundaries.
+    return sanitize_telegram_html(report)
+
+
+async def deliver_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, report: str):
     chunks, current = [], ""
     for paragraph in report.split("\n\n"):
         candidate = (current + "\n\n" + paragraph).strip()
@@ -134,20 +144,32 @@ async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=F
         chunks.append(current)
     for chunk in chunks:
         await context.bot.send_message(
-            chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
+
+
+async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=False):
+    report = await generate_report(urgent=urgent)
+    await deliver_report(chat_id, context, report)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
+        await update.message.reply_text(
+            "Vítej v Military Intelligence. Tento účet zatím není povolen pro ovládání bota.\n"
+            "Pro přidání mezi příjemce pošli /id a předej zobrazená ID správci bota."
+        )
         return
     await update.message.reply_text(
         "🛰 <b>Military Intelligence</b>\n\n"
         "Příkazy:\n"
-        "/report – aktuální denní přehled\n"
-        "/urgent – mimořádný přehled posledních událostí\n"
+        "/report – aktuální přehled\n"
+        "/urgent – mimořádný přehled\n"
         "/sources – seznam sledovaných zdrojů\n"
+        "/id – zobrazí Telegram ID\n"
         "/help – nápověda\n\n"
         "Automatický přehled je plánován každý den v 19:00 (Europe/Prague).",
         parse_mode=ParseMode.HTML,
@@ -191,30 +213,36 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return the chat and user IDs to the user in the private bot chat."""
-    if not await authorized(update):
-        return
+    # Deliberately available to new recipients: it reveals only the caller's own IDs.
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else "neznámé"
     await update.message.reply_text(
         f"TELEGRAM_CHAT_ID: {chat_id}\n"
-        f"TELEGRAM_ALLOWED_USER_ID: {user_id}\n\n"
-        "Tyto hodnoty vlož do Railway → worker → Variables."
+        f"TELEGRAM_USER_ID: {user_id}\n\n"
+        "Předej tato čísla správci bota, aby tě mohl přidat mezi příjemce."
     )
 
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
-    if not CHAT_ID:
-        log.error("TELEGRAM_CHAT_ID is missing; daily report not sent.")
+    chat_ids = recipient_chat_ids()
+    if not chat_ids:
+        log.error("No recipient Telegram chat IDs configured. Set TELEGRAM_CHAT_IDS.")
         return
     try:
-        await send_report(int(CHAT_ID), context)
+        # Build once; distribute the same report to all recipients to avoid duplicate API usage.
+        report = await generate_report()
     except Exception:
-        log.exception("Daily briefing failed")
+        log.exception("Daily briefing generation failed")
+        return
+    for chat_id in chat_ids:
+        try:
+            await deliver_report(chat_id, context, report)
+            log.info("Daily briefing sent to chat ID %s", chat_id)
+        except Exception:
+            log.exception("Daily briefing delivery failed for chat ID %s", chat_id)
 
 
 async def post_init(app: Application):
-    # Run every day at 19:00 local Prague time.
     app.job_queue.run_daily(daily_job, time=time(hour=19, minute=0, tzinfo=TZ), name="daily-briefing")
     log.info("Daily briefing scheduled for 19:00 %s", TZ)
 
