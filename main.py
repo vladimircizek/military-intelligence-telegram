@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import os
+import re
+import html
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -33,6 +37,82 @@ async def authorized(update: Update) -> bool:
     return bool(user and str(user.id) == allowed)
 
 
+class TelegramHTMLSanitizer(HTMLParser):
+    """Keep only Telegram-supported HTML and convert common block tags safely."""
+    ALLOWED = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.stack = []
+
+    def _newline(self):
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs = dict(attrs)
+        if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._newline()
+            return
+        if tag in {"br", "hr"}:
+            self._newline()
+            return
+        if tag == "li":
+            self._newline()
+            self.parts.append("• ")
+            return
+        if tag == "a":
+            href = html.unescape(attrs.get("href", "") or "")
+            parsed = urlparse(href)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                safe_href = html.escape(href, quote=True)
+                self.parts.append(f'<a href="{safe_href}">')
+                self.stack.append("a")
+            return
+        if tag in self.ALLOWED:
+            self.parts.append(f"<{tag}>")
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li"}:
+            self._newline()
+            return
+        if tag in {"a"} | self.ALLOWED and tag in self.stack:
+            # Close nested tags in reverse order until the matching tag.
+            while self.stack:
+                open_tag = self.stack.pop()
+                self.parts.append(f"</{open_tag}>")
+                if open_tag == tag:
+                    break
+
+    def handle_data(self, data):
+        self.parts.append(html.escape(data))
+
+    def handle_entityref(self, name):
+        self.parts.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.parts.append(f"&#{name};")
+
+    def result(self):
+        while self.stack:
+            self.parts.append(f"</{self.stack.pop()}>")
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def sanitize_telegram_html(value: str) -> str:
+    parser = TelegramHTMLSanitizer()
+    parser.feed(value or "")
+    parser.close()
+    return parser.result()
+
+
 async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=False):
     articles = await asyncio.to_thread(collect_articles, urgent=urgent)
     if not articles:
@@ -40,6 +120,7 @@ async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=F
         return
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     report = await build_briefing(client, articles, urgent=urgent)
+    report = sanitize_telegram_html(report)
     # Telegram limit is 4096 chars; split at paragraph boundaries.
     chunks, current = [], ""
     for paragraph in report.split("\n\n"):
@@ -81,14 +162,22 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
         return
     await update.message.reply_text("🔎 Prověřuji zdroje a připravuji přehled…")
-    await send_report(update.effective_chat.id, context)
+    try:
+        await send_report(update.effective_chat.id, context)
+    except Exception:
+        log.exception("Manual report failed")
+        await update.message.reply_text("Při sestavení nebo odeslání přehledu nastala chyba. Zkontroluji ji v Railway logu.")
 
 
 async def urgent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized(update):
         return
     await update.message.reply_text("🚨 Prověřuji poslední mimořádné události…")
-    await send_report(update.effective_chat.id, context, urgent=True)
+    try:
+        await send_report(update.effective_chat.id, context, urgent=True)
+    except Exception:
+        log.exception("Urgent report failed")
+        await update.message.reply_text("Při sestavení nebo odeslání mimořádného přehledu nastala chyba. Zkontroluji ji v Railway logu.")
 
 
 async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,8 +197,8 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else "neznámé"
     await update.message.reply_text(
-        f"TELEGRAM_CHAT_ID: {chat_id}\\n"
-        f"TELEGRAM_ALLOWED_USER_ID: {user_id}\\n\\n"
+        f"TELEGRAM_CHAT_ID: {chat_id}\n"
+        f"TELEGRAM_ALLOWED_USER_ID: {user_id}\n\n"
         "Tyto hodnoty vlož do Railway → worker → Variables."
     )
 
