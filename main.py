@@ -101,6 +101,19 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return the chat and user IDs to the user in the private bot chat."""
+    if not await authorized(update):
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else "neznámé"
+    await update.message.reply_text(
+        f"TELEGRAM_CHAT_ID: {chat_id}\\n"
+        f"TELEGRAM_ALLOWED_USER_ID: {user_id}\\n\\n"
+        "Tyto hodnoty vlož do Railway → worker → Variables."
+    )
+
+
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     if not CHAT_ID:
         log.error("TELEGRAM_CHAT_ID is missing; daily report not sent.")
@@ -124,6 +137,7 @@ def main():
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("urgent", urgent_cmd))
     app.add_handler(CommandHandler("sources", sources_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
     log.info("Military Intelligence Telegram bot is starting")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
