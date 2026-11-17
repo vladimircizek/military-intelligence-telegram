@@ -22,19 +22,15 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 
-def _parse_ids(raw: str | None) -> list[str]:
-    if not raw:
-        return []
+def _parse_ids(raw):
     result = []
-    for item in re.split(r"[,;\s]+", raw.strip()):
-        item = item.strip()
+    for item in re.split(r"[,;\s]+", (raw or "").strip()):
         if item and item not in result:
             result.append(item)
     return result
 
 
-def recipient_chat_ids() -> list[int]:
-    # Prefer the plural variable; preserve compatibility with the old single-ID variable.
+def recipient_chat_ids():
     raw = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID", "")
     ids = []
     for item in _parse_ids(raw):
@@ -45,7 +41,7 @@ def recipient_chat_ids() -> list[int]:
     return ids
 
 
-async def authorized(update: Update) -> bool:
+async def authorized(update):
     allowed = _parse_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
     if not allowed:
         allowed = _parse_ids(os.getenv("TELEGRAM_ALLOWED_USER_ID"))
@@ -60,8 +56,7 @@ class TelegramHTMLSanitizer(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.parts = []
-        self.stack = []
+        self.parts, self.stack = [], []
 
     def _newline(self):
         if self.parts and not self.parts[-1].endswith("\n"):
@@ -70,24 +65,18 @@ class TelegramHTMLSanitizer(HTMLParser):
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         attrs = dict(attrs)
-        if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"}:
+        if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "br", "hr"}:
             self._newline()
-            return
-        if tag in {"br", "hr"}:
-            self._newline()
-            return
-        if tag == "li":
+        elif tag == "li":
             self._newline()
             self.parts.append("• ")
-            return
-        if tag == "a":
+        elif tag == "a":
             href = html.unescape(attrs.get("href", "") or "")
             parsed = urlparse(href)
             if parsed.scheme in {"http", "https"} and parsed.netloc:
                 self.parts.append(f'<a href="{html.escape(href, quote=True)}">')
                 self.stack.append("a")
-            return
-        if tag in self.ALLOWED:
+        elif tag in self.ALLOWED:
             self.parts.append(f"<{tag}>")
             self.stack.append(tag)
 
@@ -95,12 +84,11 @@ class TelegramHTMLSanitizer(HTMLParser):
         tag = tag.lower()
         if tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li"}:
             self._newline()
-            return
-        if tag in ({"a"} | self.ALLOWED) and tag in self.stack:
+        elif tag in ({"a"} | self.ALLOWED) and tag in self.stack:
             while self.stack:
-                open_tag = self.stack.pop()
-                self.parts.append(f"</{open_tag}>")
-                if open_tag == tag:
+                opened = self.stack.pop()
+                self.parts.append(f"</{opened}>")
+                if opened == tag:
                     break
 
     def handle_data(self, data):
@@ -115,23 +103,42 @@ class TelegramHTMLSanitizer(HTMLParser):
         return text.strip()
 
 
-def sanitize_telegram_html(value: str) -> str:
+def sanitize_telegram_html(value):
     parser = TelegramHTMLSanitizer()
     parser.feed(value or "")
     parser.close()
     return parser.result()
 
 
-async def generate_report(urgent: bool = False) -> str:
+async def generate_report(urgent=False):
     articles = await asyncio.to_thread(collect_articles, urgent=urgent)
     if not articles:
-        return "Nenašel jsem dostatek nových zpráv z nastavených zdrojů."
+        return "Nenašel jsem dostatek nových zpráv. Zkontroluj dostupnost RSS zdrojů v Railway logu.", []
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     report = await build_briefing(client, articles, urgent=urgent)
-    return sanitize_telegram_html(report)
+    return sanitize_telegram_html(report), articles
 
 
-async def deliver_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, report: str):
+async def deliver_report(chat_id, context, report, articles=None):
+    # Up to three real lead images found in RSS metadata; never generate placeholders.
+    sent, count = set(), 0
+    for article in (articles or []):
+        image_url = article.get("image")
+        if not image_url or image_url in sent:
+            continue
+        sent.add(image_url)
+        caption = (
+            f"{article.get('title', 'Fotografie ke zprávě')[:650]}\n"
+            f"Zdroj: {article.get('source', 'neznámý')}\n{article.get('link', '')}"
+        )
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=image_url, caption=caption[:1024])
+            count += 1
+            if count >= 3:
+                break
+        except Exception:
+            log.warning("Could not send RSS image from %s", article.get("source"), exc_info=True)
+
     chunks, current = [], ""
     for paragraph in report.split("\n\n"):
         candidate = (current + "\n\n" + paragraph).strip()
@@ -144,19 +151,17 @@ async def deliver_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, repor
         chunks.append(current)
     for chunk in chunks:
         await context.bot.send_message(
-            chat_id=chat_id,
-            text=chunk,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=False,
         )
 
 
-async def send_report(chat_id: int, context: ContextTypes.DEFAULT_TYPE, urgent=False):
-    report = await generate_report(urgent=urgent)
-    await deliver_report(chat_id, context, report)
+async def send_report(chat_id, context, urgent=False):
+    report, articles = await generate_report(urgent=urgent)
+    await deliver_report(chat_id, context, report, articles)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
     if not await authorized(update):
         await update.message.reply_text(
             "Vítej v Military Intelligence. Tento účet zatím není povolen pro ovládání bota.\n"
@@ -165,33 +170,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🛰 <b>Military Intelligence</b>\n\n"
-        "Příkazy:\n"
-        "/report – aktuální přehled\n"
-        "/urgent – mimořádný přehled\n"
-        "/sources – seznam sledovaných zdrojů\n"
-        "/id – zobrazí Telegram ID\n"
-        "/help – nápověda\n\n"
+        "Příkazy:\n/report – aktuální přehled\n/urgent – mimořádný přehled\n"
+        "/sources – seznam sledovaných zdrojů\n/id – zobrazí Telegram ID\n/help – nápověda\n\n"
         "Automatický přehled je plánován každý den v 19:00 (Europe/Prague).",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update, context):
     await start(update, context)
 
 
-async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def report_cmd(update, context):
     if not await authorized(update):
         return
-    await update.message.reply_text("🔎 Prověřuji zdroje a připravuji přehled…")
+    await update.message.reply_text("🔎 Prověřuji rozšířenou síť zdrojů a připravuji přehled…")
     try:
         await send_report(update.effective_chat.id, context)
     except Exception:
         log.exception("Manual report failed")
-        await update.message.reply_text("Při sestavení nebo odeslání přehledu nastala chyba. Zkontroluji ji v Railway logu.")
+        await update.message.reply_text("Při sestavení nebo odeslání přehledu nastala chyba. Zkontroluj Railway log.")
 
 
-async def urgent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def urgent_cmd(update, context):
     if not await authorized(update):
         return
     await update.message.reply_text("🚨 Prověřuji poslední mimořádné události…")
@@ -199,50 +200,49 @@ async def urgent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_report(update.effective_chat.id, context, urgent=True)
     except Exception:
         log.exception("Urgent report failed")
-        await update.message.reply_text("Při sestavení nebo odeslání mimořádného přehledu nastala chyba. Zkontroluji ji v Railway logu.")
+        await update.message.reply_text("Při sestavení nebo odeslání mimořádného přehledu nastala chyba. Zkontroluj Railway log.")
 
 
-async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sources_cmd(update, context):
     if not await authorized(update):
         return
     await update.message.reply_text(
-        "Sledované zdroje (RSS): BBC World, BBC Europe, BBC Middle East, "
-        "Institute for the Study of War (ISW), NATO News a UN News. "
-        "Zdroje se mohou měnit podle dostupnosti jejich RSS kanálů."
+        "Sledované RSS zdroje: BBC World/Europe/Middle East, Al Jazeera English, France 24, "
+        "Deutsche Welle, The Guardian, Sky News, NPR, ISW, RUSI, Defense News, Breaking Defense, "
+        "NATO, OSN, US Department of Defense, The Diplomat, Times of Israel a South China Morning Post. "
+        "Dostupnost feedů se kontroluje v Railway logu. Reuters a AP nemají spolehlivý veřejný RSS feed, "
+        "proto nejsou uváděny jako přímo načítané zdroje."
     )
 
 
-async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Deliberately available to new recipients: it reveals only the caller's own IDs.
+async def id_cmd(update, context):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else "neznámé"
     await update.message.reply_text(
-        f"TELEGRAM_CHAT_ID: {chat_id}\n"
-        f"TELEGRAM_USER_ID: {user_id}\n\n"
+        f"TELEGRAM_CHAT_ID: {chat_id}\nTELEGRAM_USER_ID: {user_id}\n\n"
         "Předej tato čísla správci bota, aby tě mohl přidat mezi příjemce."
     )
 
 
-async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+async def daily_job(context):
     chat_ids = recipient_chat_ids()
     if not chat_ids:
         log.error("No recipient Telegram chat IDs configured. Set TELEGRAM_CHAT_IDS.")
         return
     try:
-        # Build once; distribute the same report to all recipients to avoid duplicate API usage.
-        report = await generate_report()
+        report, articles = await generate_report()
     except Exception:
         log.exception("Daily briefing generation failed")
         return
     for chat_id in chat_ids:
         try:
-            await deliver_report(chat_id, context, report)
+            await deliver_report(chat_id, context, report, articles)
             log.info("Daily briefing sent to chat ID %s", chat_id)
         except Exception:
             log.exception("Daily briefing delivery failed for chat ID %s", chat_id)
 
 
-async def post_init(app: Application):
+async def post_init(app):
     app.job_queue.run_daily(daily_job, time=time(hour=19, minute=0, tzinfo=TZ), name="daily-briefing")
     log.info("Daily briefing scheduled for 19:00 %s", TZ)
 
